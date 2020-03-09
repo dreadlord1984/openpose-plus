@@ -1,89 +1,128 @@
-# OpenPose-Plus: Fast and Flexible OpenPose Framework based on TensorFlow and TensorLayer
+# OpenPose-Plus: Pose Estimation in the Wild
 
 </a>
 <p align="center">
     <img src="https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/doc/media/dance_foot.gif?raw=true", width="360">
 </p>
 
+[![Documentation Status](https://readthedocs.org/projects/openpose-plus/badge/?version=latest)](https://openpose-plus.readthedocs.io/en/latest/?badge=latest)
 
-## Motivation
-
-[OpenPose](https://github.com/CMU-Perceptual-Computing-Lab/openpose) is the state-of-the-art real-time 2D pose estimation algorithm. 
-In the official Caffe-based [codebase](https://github.com/ZheC/Realtime_Multi-Person_Pose_Estimation),
-data processing, training, and neural network blocks are heavily interleaved and mostly hard-coded. This makes it difficult
-to be customised for achieving the best performance in our custom pose estimation applications.
-Hence, we develop OpenPose-Plus, a fast and flexible pose estimation framework that offers the following powerful features:
+[OpenPose](https://github.com/CMU-Perceptual-Computing-Lab/openpose) is the state-of-the-art pose estimation algorithm.
+In its Caffe [codebase](https://github.com/ZheC/Realtime_Multi-Person_Pose_Estimation),
+data augmentation, training, and neural networks are most hard-coded. They are difficult
+to be customized. In addition,
+key performance features such as embedded platform supports and parallel GPU training are missing.
+All these limitations makes OpenPose, in these days, hard to
+be deployed in the wild. To resolve this, we develop **OpenPose-Plus**, a high-performance yet flexible pose estimation framework that offers many powerful features:
 - Flexible combination of standard training dataset with your own custom labelled data.
-- Customisable data augmentation pipeline without compromising performance
+- Customizable data augmentation pipeline without compromising performance
 - Deployment on embedded platforms using TensorRT
 - Switchable neural networks (e.g., changing VGG to MobileNet for minimal memory consumption)
-- Integrated training on a single GPU and multiple GPUs
+- High-performance training using multiple GPUs
 
-## Work in progress
-
-This project is still under active development, some of the TODOs are as follows:
-- Distributed training
-- Pose Proposal Networks, ECCV 2018
-
-## Key project files
-
-- `config.py` : config of the training details.
-- `train.py`: trains the model.
-
-## Preparation
-
-Build C++ library for post processing. See [instruction](https://github.com/ildoonet/tf-pose-estimation/tree/master/tf_pose/pafprocess)
-
-```bash
-cd inference/pafprocess
-make
-
-# ** before recompiling **
-rm -rf build
-rm *.so
-```
-
-## Training your model
+## Custom Model Training
 
 Training the model is implemented using TensorFlow. To run `train.py`, you would need to install packages, shown
-in [requirements.txt](https://github.com/tensorlayer/openpose-plus/blob/master/requirements.txt), in your virtual environment (Python <=3.6):
+in [requirements.txt](https://github.com/tensorlayer/openpose-plus/blob/master/requirements.txt), in your virtual environment (**Python 3**):
 
 ```bash
-pip install -r requirements.txt
-pip install pycocotools
+pip3 install -r requirements.txt
+pip3 install pycocotools
 ```
 
-`train.py` will automatically download MSCOCO 2017 dataset into `dataset/coco17`.
-The default model in `models.py` is based on VGG19, which is the same with the original paper.
-If you want to customize the model, simply change it in `models.py`.
-And then `train.py` will train the model to the end.
+`train.py` automatically download MSCOCO 2017 dataset into `dataset/coco17`.
+The default model is VGG19 used in the OpenPose paper.
+To customize the model, simply changing it in `models.py`.
 
-In `config.py`, `config.DATA.train_data` can be:
+You can use `train_config.py` to configure the training. `config.DATA.train_data` can be:
 * `coco`: training data is COCO dataset only (default)
 * `custom`: training data is your dataset specified by `config.DATA.your_xxx`
 * `coco_and_custom`: training data is COCO and your dataset
 
 `config.MODEL.name` can be:
-* `vgg`: VGG19 version (default), slow  
+* `vgg`: VGG19 version (default), slow
 * `vggtiny`: VGG tiny version, faster
 * `mobilenet`: MobileNet version, faster
 
-`config.TRAIN.train_mode` can be:
-* `local`: single GPU training
-* `distributed`: multiple GPU training (on-going work)
+Train your model by running:
 
-## 5. Inference
+```bash
+python3 train.py
+```
 
-Currently we provide two C++ APIs for inference, both defined in `include/openpose-plus.hpp`.
-They are for running the tensorflow model with tensorRT and post-processing respectively.
+### Additional steps for training on Windows
 
-You can look the examples in the `examples` folder to see how to use the APIs.
+There are a few extra steps to follow with Windows. Please make sure you have the following prerequisites installed:
+* [git](https://git-scm.com/downloads)
+* [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+* [wget](https://eternallybored.org/misc/wget/)
+
+Download the wget executable and copy it into one of your folders in System path to use the wget command from anywhere. Use the `path` command in command line to find the folders. Paste the wget.exe in one of the folders given by `path`. An example folder is `C:\Windows`.
+
+pycocotools is not supported by default on Windows. Use the pycocotools build for Windows at [here](https://github.com/philferriere/cocoapi). Instead of `pip install pycocotools`, using:
+```bash
+pip install git+https://github.com/philferriere/cocoapi.git#subdirectory=PythonAPI
+```
+
+Visual C++ Build Tools are required by the build. Everything else is the same.
+
+## Distributed Training
+
+The pose estimation neural network can take days to train.
+To speed up training, we support distributed GPU training.
+We use the [KungFu](https://github.com/lsds/KungFu) library to scale out training.
+KungFu is very easy to install and run (compared to the previously used Horovod library
+which depends on OpenMPI), and simply follow
+the [instruction](https://github.com/lsds/KungFu#install).
+
+In the following, we assume that you have added `kungfu-run` into the `$PATH`.
+
+(i) To run on a machine with 4 GPUs:
+
+```bash
+kungfu-run -np 4 python3 train.py --parallel --kf-optimizer=sma
+```
+
+The default KungFu optimizer is `sma` which implements synchronous model averaging.
+You can also use other KungFu optimizers: `sync-sgd` (which is the same as the DistributedOptimizer in Horovod)
+and `async-sgd` if you train your model in a cluster that has limited bandwidth and straggelers.
+
+(ii) To run on 2 machines (which have the nic `eth0` with IPs as `192.168.0.1` and `192.168.0.2`):
+
+```bash
+kungfu-run -np 8 -H 192.168.0.1:4,192.168.0.1:4 -nic eth0 python3 train.py --parallel --kf-optimizer=sma
+```
+
+## High-performance Inference using TensorRT
+
+Real-time inference on resource-constrained embedded platforms is always challenging. To resolve this, we provide a TensorRT-compatible inference engine.
+The engine has two C++ APIs, both defined in `include/openpose-plus.hpp`.
+They are for running the TensorFlow model with TensorRT and post-processing respectively.
+
+For details of inference(dependencies/quick start), please refer to [**cpp-inference**](doc/markdown-doc/cpp-inference.md).
+
+We are improving the performance of the engine.
+Initial benchmark results for running the full OpenPose model are as follows.
+On Jetson TX2, the inference speed is 13 frames / second (the mobilenet variant is even faster).
+On Jetson TX1, the speed is 10 frames / second. On Titan 1050, the speed is 38 frames / second. 
+
+After our first optimization, we achieved 50FPS(float32) on 1070Ti. 
+
+We also have a Python binding for the engine. The current binding relies on
+the external tf-pose-estimation project. We are working on providing the Python binding for our high-performance
+C++ implementation. For now, to enable the binding, please build C++ library for post processing by:
+
+```bash
+./scripts/install-pafprocess.sh
+# swig is required. Run `conda install -c anaconda swig` to install swig.
+```
+
+See [tf-pose](https://github.com/ildoonet/tf-pose-estimation/tree/master/tf_pose/pafprocess) for details.
+
+## Live Camera Example
+
+You can look at the examples in the `examples` folder to see how to use the inference C++ APIs.
 Running `./scripts/live-camera.sh` will give you a quick review of how it works.
-
-You can build the APIs into a standard C++ library by just running `make pack`, provided that you have the following dependencies installed
-
-  - tensorRT
-  - opencv
 
 <!---
 ## 5. Inference
@@ -127,7 +166,13 @@ For TensorRT float16 (half-float) inferencing, xxx
     2. concatenate the list of your own data JSON into ...
 -->
 
-## Discussion
+## License
+
+You can use the project code under a free [Apache 2.0 license](https://github.com/tensorlayer/tensorlayer/blob/master/LICENSE.rst) ONLY IF you:
+- Cite the [TensorLayer paper](https://github.com/tensorlayer/tensorlayer#cite) and this project in your research article if you are an **academic user**.
+- Acknowledge TensorLayer and this project in your project websites/articles if you are a **commercial user**.
+
+## Related Discussion
 
 - [TensorLayer Slack](https://join.slack.com/t/tensorlayer/shared_invite/enQtMjUyMjczMzU2Njg4LWI0MWU0MDFkOWY2YjQ4YjVhMzI5M2VlZmE4YTNhNGY1NjZhMzUwMmQ2MTc0YWRjMjQzMjdjMTg2MWQ2ZWJhYzc)
 - [TensorLayer WeChat](https://github.com/tensorlayer/tensorlayer-chinese/blob/master/docs/wechat_group.md)

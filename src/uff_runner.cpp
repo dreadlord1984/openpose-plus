@@ -8,15 +8,18 @@
 #include <string>
 #include <vector>
 
+#include <ttl/cuda_tensor>
+#include <ttl/experimental/copy>
+#include <ttl/range>
+
 #include <NvInfer.h>
 #include <NvUffParser.h>
 #include <NvUtils.h>
-#include <stdtracer>
 
 #include <openpose-plus.h>
 
 #include "logger.h"
-#include "std_cuda_tensor.hpp"
+#include "trace.hpp"
 
 using input_info_t = std::vector<std::pair<std::string, std::vector<int>>>;
 
@@ -25,7 +28,7 @@ Logger gLogger;
 inline int64_t volume(const nvinfer1::Dims &d)
 {
     int64_t v = 1;
-    for (int i = 0; i < d.nbDims; i++) v *= d.d[i];
+    for (int i = 0; i < d.nbDims; i++) { v *= d.d[i]; }
     return v;
 }
 
@@ -48,12 +51,14 @@ inline size_t elementSize(nvinfer1::DataType t)
 
 std::string to_string(const nvinfer1::Dims &d)
 {
-    std::string s;
-    for (int64_t i = 0; i < d.nbDims; i++) {
-        if (!s.empty()) { s += ", "; }
-        s += std::to_string(d.d[i]);
+    std::string s{"("};
+    if (d.nbDims != 0) {
+        for (int64_t i = 0; i < d.nbDims; i++)
+            (s += std::to_string(d.d[i])) += ", ";
+        s.pop_back();
+        s.pop_back();
     }
-    return "(" + s + ")";
+    return s + ")";
 }
 
 std::string to_string(const nvinfer1::DataType dtype)
@@ -97,7 +102,7 @@ create_engine(const std::string &model_file, const input_info_t &input_info,
               const std::vector<std::string> &output_names, int max_batch_size,
               bool use_f16)
 {
-    TRACE(__func__);
+    TRACE_SCOPE(__func__);
     destroy_ptr<nvuffparser::IUffParser> parser(nvuffparser::createUffParser());
     for (const auto &info : input_info) {
         const auto dims = info.second;
@@ -120,7 +125,7 @@ create_engine(const std::string &model_file, const input_info_t &input_info,
     return engine;
 }
 
-class uff_runner_impl : public uff_runner
+class uff_runner_impl : public pose_detection_runner
 {
   public:
     uff_runner_impl(const std::string &model_file,
@@ -129,14 +134,17 @@ class uff_runner_impl : public uff_runner
                     int max_batch_size, bool use_f16);
     ~uff_runner_impl() override;
 
-    void execute(const std::vector<void *> &inputs,
-                 const std::vector<void *> &outputs, int batch_size) override;
+    void operator()(const std::vector<void *> &inputs,
+                    const std::vector<void *> &outputs,
+                    int batch_size) override;
 
   private:
+    const int max_batch_size;
+
     destroy_ptr<nvinfer1::ICudaEngine> engine_;
 
-    using cuda_buffer_t = cuda_tensor<char, 1>;
-    std::vector<std::unique_ptr<cuda_buffer_t>> buffers_;
+    using cuda_buffer_t = ttl::cuda_tensor<char, 2>;  // [batch_size, data_size]
+    std::vector<cuda_buffer_t> buffers_;
 
     void createBuffers_(int batch_size);
 };
@@ -145,7 +153,8 @@ uff_runner_impl::uff_runner_impl(const std::string &model_file,
                                  const input_info_t &input_info,
                                  const std::vector<std::string> &output_names,
                                  int max_batch_size, bool use_f16)
-    : engine_(create_engine(model_file, input_info, output_names,
+    : max_batch_size(max_batch_size),
+      engine_(create_engine(model_file, input_info, output_names,
                             max_batch_size, use_f16))
 {
     createBuffers_(max_batch_size);
@@ -155,64 +164,65 @@ uff_runner_impl::~uff_runner_impl() { nvuffparser::shutdownProtobufLibrary(); }
 
 void uff_runner_impl::createBuffers_(int batch_size)
 {
-    TRACE(__func__);
-
-    const int n = engine_->getNbBindings();
-    for (int i = 0; i < n; ++i) {
+    TRACE_SCOPE(__func__);
+    for (auto i : ttl::range(engine_->getNbBindings())) {
         const nvinfer1::Dims dims = engine_->getBindingDimensions(i);
         const nvinfer1::DataType dtype = engine_->getBindingDataType(i);
         const std::string name(engine_->getBindingName(i));
-
         std::cout << "binding " << i << ":"
                   << " name: " << name << " type" << to_string(dtype)
                   << to_string(dims) << std::endl;
-        const size_t mem_size = batch_size * volume(dims) * elementSize(dtype);
-        buffers_.push_back(
-            std::unique_ptr<cuda_buffer_t>(new cuda_buffer_t(mem_size)));
+        buffers_.emplace_back(batch_size, volume(dims) * elementSize(dtype));
     }
 }
 
-void uff_runner_impl::execute(const std::vector<void *> &inputs,
-                              const std::vector<void *> &outputs,
-                              int batch_size)
+void uff_runner_impl::operator()(const std::vector<void *> &inputs,
+                                 const std::vector<void *> &outputs,
+                                 int batch_size)
 {
-    TRACE("uff_runner_impl::execute");
+    TRACE_SCOPE("uff_runner_impl::operator()");
+    assert(batch_size <= max_batch_size);
 
     {
-        TRACE("copy input from host");
+        TRACE_SCOPE("copy input from host");
         int idx = 0;
-        for (int i = 0; i < buffers_.size(); ++i) {
+        for (auto i : ttl::range(buffers_.size())) {
             if (engine_->bindingIsInput(i)) {
-                buffers_[i]->fromHost(inputs[idx++]);
+                const auto buffer = buffers_[i].slice(0, batch_size);
+                ttl::tensor_view<char, 2> input(
+                    reinterpret_cast<char *>(inputs[idx++]), buffer.shape());
+                ttl::copy(buffer, input);
             }
         }
     }
 
     {
-        TRACE("uff_runner_impl::context->execute");
+        TRACE_SCOPE("uff_runner_impl::context->execute");
         auto context = engine_->createExecutionContext();
         std::vector<void *> buffer_ptrs_(buffers_.size());
-        for (int i = 0; i < buffers_.size(); ++i) {
-            buffer_ptrs_[i] = buffers_[i]->data();
-        }
+        std::transform(buffers_.begin(), buffers_.end(), buffer_ptrs_.begin(),
+                       [](const auto &b) { return b.data(); });
         context->execute(batch_size, buffer_ptrs_.data());
         context->destroy();
     }
 
     {
-        TRACE("copy output to host");
+        TRACE_SCOPE("copy output to host");
         int idx = 0;
-        for (int i = 0; i < buffers_.size(); ++i) {
+        for (auto i : ttl::range(buffers_.size())) {
             if (!engine_->bindingIsInput(i)) {
-                buffers_[i]->toHost(outputs[idx++]);
+                const auto buffer = buffers_[i].slice(0, batch_size);
+                ttl::tensor_ref<char, 2> output(
+                    reinterpret_cast<char *>(outputs[idx++]), buffer.shape());
+                ttl::copy(output, ttl::view(buffer));
             }
         }
     }
 }
 
-uff_runner *create_openpose_runner(const std::string &model_file,
-                                   int input_height, int input_width,
-                                   int max_batch_size, bool use_f16)
+pose_detection_runner *
+create_pose_detection_runner(const std::string &model_file, int input_height,
+                             int input_width, int max_batch_size, bool use_f16)
 {
     const input_info_t input_info = {
         {

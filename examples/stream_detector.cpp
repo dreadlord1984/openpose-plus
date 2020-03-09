@@ -4,15 +4,13 @@
 #include <thread>
 
 #include <opencv2/opencv.hpp>
-#include <stdtensor>
-#include <stdtracer>
-
-using ttl::tensor;
+#include <ttl/tensor>
 
 #include <openpose-plus.h>
 
 #include "channel.hpp"
 #include "input.h"
+#include "trace.hpp"
 #include "vis.h"
 
 struct default_inputer : stream_detector::inputer_t {
@@ -73,17 +71,17 @@ class stream_detector_impl : public stream_detector
           image_stream_3(buffer_size),
           feature_stream_1(buffer_size),
           feature_stream_2(buffer_size),
-          paf_process(create_paf_processor(feature_height, feature_width,
+          process_paf(create_paf_processor(feature_height, feature_width,
                                            input_height, input_width, n_joins,
-                                           n_connections, gauss_kernel_size))
+                                           n_connections, gauss_kernel_size)),
+          compute_feature_maps(create_pose_detection_runner(model_file, height,
+                                                            width, 1, use_f16))
     {
-        runner.reset(
-            create_openpose_runner(model_file, height, width, 1, use_f16));
     }
 
     void run(inputer_t &in, handler_t &handle, int count) override
     {
-        TRACE(__func__);
+        TRACE_SCOPE(__func__);
         std::vector<std::thread> ths;
 
         for (int i = 0; i < buffer_size; ++i) {
@@ -110,7 +108,8 @@ class stream_detector_impl : public stream_detector
             for (int i = 0; i < count; ++i) {
                 const auto p = image_stream_2.get();
                 const auto q = feature_stream_1.get();
-                runner->execute({p.chw_ptr}, {q.heatmap_ptr, q.paf_ptr}, 1);
+                (*compute_feature_maps)({p.chw_ptr}, {q.paf_ptr, q.heatmap_ptr},
+                                        1);
                 feature_stream_2.put(q);
                 image_stream_3.put(p);
             }
@@ -121,7 +120,7 @@ class stream_detector_impl : public stream_detector
                 const auto p = image_stream_3.get();
                 const auto q = feature_stream_2.get();
                 const auto humans =
-                    (*paf_process)(q.heatmap_ptr, q.paf_ptr, false);
+                    (*process_paf)(q.heatmap_ptr, q.paf_ptr, false);
                 printf("got %lu humnas from %d-th image\n", humans.size(), i);
                 bool draw_humans = true;
                 if (draw_humans) {
@@ -155,10 +154,10 @@ class stream_detector_impl : public stream_detector
 
     const bool flip_rgb;
 
-    tensor<uint8_t, 4> hwc_images;
-    tensor<float, 4> chw_images;
-    tensor<float, 4> confs;
-    tensor<float, 4> pafs;
+    ttl::tensor<uint8_t, 4> hwc_images;
+    ttl::tensor<float, 4> chw_images;
+    ttl::tensor<float, 4> confs;
+    ttl::tensor<float, 4> pafs;
 
     struct in_stream_t {
         uint8_t *hwc_ptr;
@@ -177,8 +176,8 @@ class stream_detector_impl : public stream_detector
     channel<feature_stream_t> feature_stream_1;
     channel<feature_stream_t> feature_stream_2;
 
-    std::unique_ptr<paf_processor> paf_process;
-    std::unique_ptr<uff_runner> runner;
+    std::unique_ptr<paf_processor> process_paf;
+    std::unique_ptr<pose_detection_runner> compute_feature_maps;
 };
 
 stream_detector *stream_detector::create(const std::string &model_file,

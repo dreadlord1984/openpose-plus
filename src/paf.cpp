@@ -1,15 +1,11 @@
 #include <algorithm>
-#include <functional>
 
-#include <stdtensor>
-#include <stdtracer>
-
-using ttl::tensor;
-using ttl::tensor_ref;
+#include <ttl/tensor>
 
 #include <openpose-plus.h>
 
-#include "post-process.h"
+#include "post_process.hpp"
+#include "trace.hpp"
 
 struct VectorXY {
     float x;
@@ -29,9 +25,9 @@ class paf_processor_impl : public paf_processor
           input_width(input_width),
           n_joins(n_joins),
           n_connections(n_connections),
-          upsample_conf(n_joins, height, width),
-          upsample_paf(n_connections * 2, height, width),
-          peak_finder(n_joins, height, width, gauss_kernel_size)
+          upsample_conf_dim(n_joins, height, width),
+          upsample_paf_dim(n_connections * 2, height, width),
+          peak_param(n_joins, height, width, gauss_kernel_size)
     {
     }
 
@@ -40,20 +36,29 @@ class paf_processor_impl : public paf_processor
         const float *paf_ /* [n_connections * 2, input_height, input_width] */,
         bool use_gpu)
     {
-        TRACE("paf_processor_impl::operator()");
+        TRACE_SCOPE("paf_processor_impl::operator()");
+        // TODO: To be optimized here.
+        thread_local ttl::tensor<float, 3> upsample_conf_(
+            upsample_conf_dim);  // 5FPS
+        thread_local ttl::tensor<float, 3> upsample_paf_(
+            upsample_paf_dim);  // 5FPS
+        thread_local peak_finder_t<float> peak_finder_(
+            peak_param.dims()[0], peak_param.dims()[1], peak_param.dims()[2],
+            peak_param.dims()[3]);
         {
-            TRACE("resize heatmap and PAF");
-            resize_area(tensor_ref<float, 3>((float *)conf_, n_joins,
-                                             input_height, input_width),
-                        upsample_conf);
-            resize_area(tensor_ref<float, 3>((float *)paf_, n_connections * 2,
-                                             input_height, input_width),
-                        upsample_paf);
+            TRACE_SCOPE("resize heatmap and PAF");
+            resize_area(ttl::tensor_view<float, 3>(conf_, n_joins, input_height,
+                                                   input_width),
+                        ttl::ref(upsample_conf_));
+            resize_area(ttl::tensor_view<float, 3>(paf_, n_connections * 2,
+                                                   input_height, input_width),
+                        ttl::ref(upsample_paf_));
         }
-        const auto all_peaks =
-            peak_finder.find_peak_coords(upsample_conf, THRESH_HEAT, use_gpu);
-        const auto peak_ids_by_channel = peak_finder.group_by(all_peaks);
-        return process(all_peaks, peak_ids_by_channel, upsample_paf);
+        const auto all_peaks = peak_finder_.find_peak_coords(
+            ttl::view(upsample_conf_), THRESH_HEAT, use_gpu);
+        const auto peak_ids_by_channel = peak_finder_.group_by(all_peaks);
+        return process(all_peaks, peak_ids_by_channel,
+                       ttl::view(upsample_paf_));
     }
 
   private:
@@ -71,13 +76,16 @@ class paf_processor_impl : public paf_processor
     const int n_joins;
     const int n_connections;
 
-    tensor<float, 3> upsample_conf;  // [J, H, W]
-    tensor<float, 3> upsample_paf;   // [2C, H, W]
+    ttl::shape<3> upsample_conf_dim;
+    ttl::shape<3> upsample_paf_dim;
 
-    peak_finder_t<float> peak_finder;
+    //    ttl::tensor<float, 3> upsample_conf;  // [J, H, W]
+    //    ttl::tensor<float, 3> upsample_paf;   // [2C, H, W]
+
+    ttl::shape<4> peak_param;
 
     std::vector<ConnectionCandidate>
-    getConnectionCandidates(const tensor<float, 3> &pafmap,
+    getConnectionCandidates(const ttl::tensor_view<float, 3> &pafmap,
                             const std::vector<peak_info> &all_peaks,
                             const std::vector<int> &peak_index_1,
                             const std::vector<int> &peak_index_2,
@@ -134,7 +142,7 @@ class paf_processor_impl : public paf_processor
     }
 
     std::vector<Connection>
-    getConnections(const tensor<float, 3> &pafmap,
+    getConnections(const ttl::tensor_view<float, 3> &pafmap,
                    const std::vector<peak_info> &all_peaks,
                    const std::vector<std::vector<int>> &peak_ids_by_channel,
                    int pair_id, int height)
@@ -178,7 +186,7 @@ class paf_processor_impl : public paf_processor
     getHumans(const std::vector<peak_info> &all_peaks,
               const std::vector<std::vector<Connection>> &all_connections)
     {
-        TRACE(__func__);
+        TRACE_SCOPE(__func__);
 
         std::vector<human_ref_t> human_refs;
         for (int pair_id = 0; pair_id < COCO_N_PAIRS; pair_id++) {
@@ -262,11 +270,11 @@ class paf_processor_impl : public paf_processor
     }
 
     std::vector<std::vector<Connection>>
-    getAllConnections(const tensor<float, 3> &pafmap,
+    getAllConnections(const ttl::tensor_view<float, 3> &pafmap,
                       const std::vector<peak_info> &all_peaks,
                       const std::vector<std::vector<int>> &peak_ids_by_channel)
     {
-        TRACE(__func__);
+        TRACE_SCOPE(__func__);
 
         std::vector<std::vector<Connection>> all_connections;
         for (int pair_id = 0; pair_id < COCO_N_PAIRS; pair_id++) {
@@ -279,9 +287,9 @@ class paf_processor_impl : public paf_processor
     std::vector<human_t>
     process(const std::vector<peak_info> &all_peaks,
             const std::vector<std::vector<int>> &peak_ids_by_channel,
-            const tensor<float, 3> &pafmap /* [2c, h, w] */)
+            const ttl::tensor_view<float, 3> &pafmap /* [2c, h, w] */)
     {
-        TRACE("paf_processor_impl::process");
+        TRACE_SCOPE("paf_processor_impl::process");
 
         const std::vector<std::vector<Connection>> all_connections =
             getAllConnections(pafmap, all_peaks, peak_ids_by_channel);
@@ -290,7 +298,7 @@ class paf_processor_impl : public paf_processor
         printf("got %lu humans\n", human_refs.size());
 
         {
-            TRACE("generate output");
+            TRACE_SCOPE("generate output");
             std::vector<human_t> humans;
             for (const auto &hr : human_refs) {
                 human_t human;
@@ -310,11 +318,12 @@ class paf_processor_impl : public paf_processor
         }
     }
 
-    std::vector<VectorXY> get_paf_vectors(const tensor<float, 3> &pafmap,
-                                          const int &ch_id1,           //
-                                          const int &ch_id2,           //
-                                          const point_2d<int> &peak1,  //
-                                          const point_2d<int> &peak2)
+    std::vector<VectorXY>
+    get_paf_vectors(const ttl::tensor_view<float, 3> &pafmap,
+                    const int &ch_id1,           //
+                    const int &ch_id2,           //
+                    const point_2d<int> &peak1,  //
+                    const point_2d<int> &peak2)
     {
         std::vector<VectorXY> paf_vectors;
 

@@ -7,62 +7,56 @@
 
 #include <cuda_runtime.h>
 #include <opencv2/opencv.hpp>
-#include <stdtensor>
-#include <stdtracer>
-
-using ttl::tensor;
-using ttl::tensor_ref;
+#include <ttl/cuda_tensor>
+#include <ttl/experimental/copy>
+#include <ttl/range>
+#include <ttl/tensor>
 
 #include <openpose-plus.h>
 
 #include "cudnn.hpp"
-#include "std_cuda_tensor.hpp"
+#include "trace.hpp"
 
 // tf.image.resize_area
 // This is the same as OpenCV's INTER_AREA.
 // input, output are in [channel, height, width] format
 template <typename T>
-void resize_area(const tensor_ref<T, 3> &input, tensor<T, 3> &output)
+void resize_area(const ttl::tensor_view<T, 3> &input,
+                 const ttl::tensor_ref<T, 3> &output)
 {
-    TRACE(__func__);
+    TRACE_SCOPE(__func__);
 
-    const int channel = input.shape().dims[0];
-    const int height = input.shape().dims[1];
-    const int width = input.shape().dims[2];
-
-    const int target_channel = output.shape().dims[0];
-    const int target_height = output.shape().dims[1];
-    const int target_width = output.shape().dims[2];
+    const auto [channel, height, width] = input.dims();
+    const auto [target_channel, target_height, target_width] = output.dims();
 
     assert(channel == target_channel);
 
     const cv::Size size(width, height);
     const cv::Size target_size(target_width, target_height);
-    for (int k = 0; k < channel; ++k) {
+
+    // What if blob => Image => Resize => Blob?
+    //    cv::Mat feature_map(size, cv::DataType<T>::type, );
+    // TODO: Optimize here. (50% runtime cost in PAF as the channel size is too
+    // big(38)). Back soon when I get up.
+
+    for (auto k : ttl::range(channel)) {
         const cv::Mat input_image(size, cv::DataType<T>::type,
                                   (T *)input[k].data());
         cv::Mat output_image(target_size, cv::DataType<T>::type,
                              output[k].data());
         cv::resize(input_image, output_image, output_image.size(), 0, 0,
-                   CV_INTER_AREA);
+                   cv::INTER_AREA);
     }
 }
 
 template <typename T>
-void smooth(const tensor<T, 3> &input, tensor<T, 3> &output, int ksize)
+void smooth(const ttl::tensor_view<T, 3> &input,
+            const ttl::tensor_ref<T, 3> &output, int ksize)
 {
-    const T sigma = 3.0;
-
-    const int channel = input.shape().dims[0];
-    const int height = input.shape().dims[1];
-    const int width = input.shape().dims[2];
-
-    assert(channel == output.shape().dims[0]);
-    assert(height == output.shape().dims[1]);
-    assert(width == output.shape().dims[2]);
-
+    constexpr T sigma = 3.0;
+    const auto [channel, height, width] = input.dims();
     const cv::Size size(width, height);
-    for (int k = 0; k < channel; ++k) {
+    for (auto k : ttl::range(channel)) {
         const cv::Mat input_image(size, cv::DataType<T>::type,
                                   (T *)input[k].data());
         cv::Mat output_image(size, cv::DataType<T>::type, output[k].data());
@@ -95,17 +89,11 @@ void same_max_pool_3x3_2d(const int height, const int width,  //
 }
 
 template <typename T>
-void same_max_pool_3x3(const tensor<T, 3> &input, tensor<T, 3> &output)
+void same_max_pool_3x3(const ttl::tensor_view<T, 3> &input,
+                       const ttl::tensor_ref<T, 3> &output)
 {
-    const int channel = input.shape().dims[0];
-    const int height = input.shape().dims[1];
-    const int width = input.shape().dims[2];
-
-    assert(channel == output.shape().dims[0]);
-    assert(height == output.shape().dims[1]);
-    assert(width == output.shape().dims[2]);
-
-    for (int k = 0; k < channel; ++k) {
+    const auto [channel, height, width] = input.dims();
+    for (auto k : ttl::range(channel)) {
         same_max_pool_3x3_2d(height, width, input[k].data(), output[k].data());
     }
 }
@@ -150,32 +138,35 @@ template <typename T> class peak_finder_t
           pooled_gpu(channel, height, width),
           same_max_pool_3x3_gpu(1, channel, height, width, 3, 3)
     {
+        //        std::cout << "Appread Once\n" << '\n';
     }
 
-    std::vector<peak_info> find_peak_coords(const tensor<float, 3> &heatmap,
-                                            float threshold, bool use_gpu)
+    std::vector<peak_info>
+    find_peak_coords(const ttl::tensor_view<T, 3> &heatmap, float threshold,
+                     bool use_gpu)
     {
-        TRACE(__func__);
+        TRACE_SCOPE(__func__);
 
         {
-            TRACE("find_peak_coords::smooth");
-            smooth(heatmap, smoothed_cpu, ksize);
+            TRACE_SCOPE("find_peak_coords::smooth");
+            smooth(heatmap, ttl::ref(smoothed_cpu), ksize);
         }
 
         if (use_gpu) {
-            TRACE("find_peak_coords::max pooling on GPU");
-            pool_input_gpu.fromHost(smoothed_cpu.data());
+            TRACE_SCOPE("find_peak_coords::max pooling on GPU");
+            ttl::copy(ttl::ref(pool_input_gpu), ttl::view(smoothed_cpu));
+            // FIXME: pass ttl::tensor_{ref/view}
             same_max_pool_3x3_gpu(pool_input_gpu.data(), pooled_gpu.data());
             // cudaDeviceSynchronize();
-            pooled_gpu.toHost(pooled_cpu.data());
+            ttl::copy(ttl::ref(pooled_cpu), ttl::view(pooled_gpu));
         } else {
-            TRACE("find_peak_coords::max pooling on CPU");
-            same_max_pool_3x3(smoothed_cpu, pooled_cpu);
+            TRACE_SCOPE("find_peak_coords::max pooling on CPU");
+            same_max_pool_3x3(ttl::view(smoothed_cpu), ttl::ref(pooled_cpu));
         }
 
         std::vector<peak_info> all_peaks;
         {
-            TRACE("find_peak_coords::find all peaks");
+            TRACE_SCOPE("find_peak_coords::find all peaks");
 
             const auto maybe_add_peak_info = [&](int k, int i, int j, int off) {
                 if (k < COCO_N_PARTS &&  //
@@ -218,10 +209,10 @@ template <typename T> class peak_finder_t
     const int width;
     const int ksize;
 
-    tensor<T, 3> smoothed_cpu;
-    tensor<T, 3> pooled_cpu;
-    cuda_tensor<T, 3> pool_input_gpu;
-    cuda_tensor<T, 3> pooled_gpu;
+    ttl::tensor<T, 3> smoothed_cpu;
+    ttl::tensor<T, 3> pooled_cpu;
+    ttl::cuda_tensor<T, 3> pool_input_gpu;
+    ttl::cuda_tensor<T, 3> pooled_gpu;
 
     Pool_NCHW_PaddingSame_Max<T> same_max_pool_3x3_gpu;
 };
